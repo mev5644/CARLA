@@ -2,84 +2,135 @@ import carla
 import random
 import time
 
+# Connect to the client and retrieve the world object
 client = carla.Client('localhost', 2000)
-client.set_timeout(5.0)  # Set the time limit for connecting with the server.
-
+client.set_timeout(10.0)  # Set a timeout for client commands
 world = client.get_world()
+
+# Set up the simulator in synchronous mode
+settings = world.get_settings()
+settings.synchronous_mode = True  # Enables synchronous mode
+settings.fixed_delta_seconds = 0.02
+world.apply_settings(settings)
+
+# Set up the TM in synchronous mode
+traffic_manager = client.get_trafficmanager()
+traffic_manager.set_synchronous_mode(True)
+
+# Set a seed so behaviour can be repeated if necessary
+traffic_manager.set_random_device_seed(0)
+random.seed(0)
+
+actors = world.get_actors()
+
+
+def get_traffic_density(traffic_light, radius=50):
+    vehicles = world.get_actors().filter('vehicle.*')
+    density = 0
+    for vehicle in vehicles:
+        if vehicle.get_location().distance(traffic_light.get_location()) < radius:
+            density += 1
+    return density
+
+
+def set_traffic_light_state(traffic_light, state, duration):
+    traffic_light.set_state(state)
+    traffic_light.set_green_time(duration if state == carla.TrafficLightState.Green else 0)
+    traffic_light.set_yellow_time(3.0)
+    traffic_light.set_red_time(duration if state == carla.TrafficLightState.Red else 0)
+
+
+def control_traffic_lights(traffic_lights, check_interval=1, density_threshold=5, green_duration=10):
+    while True:
+        world.tick()  # Advance the simulation by one tick
+        for traffic_light in traffic_lights:
+            density = get_traffic_density(traffic_light, radius=50)
+            if density > density_threshold:
+                set_traffic_light_state(traffic_light, carla.TrafficLightState.Green, green_duration)
+                print(
+                    f"Traffic light at {traffic_light.get_location()} turned green for {green_duration} seconds due "
+                    f"to high traffic density.")
+                time.sleep(green_duration + 3.0)  # Include the yellow light duration
+                set_traffic_light_state(traffic_light, carla.TrafficLightState.Red, green_duration)
+            else:
+                set_traffic_light_state(traffic_light, carla.TrafficLightState.Red, green_duration)
+        time.sleep(check_interval)
+
+
+traffic_lights = world.get_actors().filter('traffic.traffic_light')
+
+# We will also set up the spectator
+spectator = world.get_spectator()
 
 spawn_points = world.get_map().get_spawn_points()
 
+# Select some models from the blueprint library
 models = ['dodge', 'audi', 'model3', 'mini', 'mustang', 'lincoln', 'prius', 'nissan', 'crown', 'impala']
 blueprints = []
-for vehicle in world.get_blueprint_library().filter('vehicle'):
+for vehicle in world.get_blueprint_library().filter('*vehicle*'):
     if any(model in vehicle.id for model in models):
         blueprints.append(vehicle)
 
+# Assign vehicle counts to each route
+route_vehicle_counts = [10, 10, 20, 10]
+total_vehicles = sum(route_vehicle_counts)
+
 # Set a max number of vehicles and prepare a list for those we spawn
-max_vehicles = 100
+max_vehicles = total_vehicles
 max_vehicles = min([max_vehicles, len(spawn_points)])
 vehicles = []
 
-# Draw the spawn point locations as numbers in the map
-for i, spawn_point in enumerate(spawn_points):
-    world.debug.draw_string(spawn_point.location, str(i), life_time=10)
+# Take a random sample of the spawn points and spawn some vehicles
+for i, spawn_point in enumerate(random.sample(spawn_points, max_vehicles)):
+    temp = world.try_spawn_actor(random.choice(blueprints), spawn_point)
+    if temp is not None:
+        vehicles.append(temp)
 
-spawn_point_1 = spawn_points[32]
-# Create route 1 from the chosen spawn points
-route_1_indices = [129, 28, 137, 101, 57, 58, 154, 147]
-route_1 = []
-for ind in route_1_indices:
-    route_1.append(spawn_points[ind].location)
+# Routes with their respective spawn points and indices
+routes = [
+    ([32], [129, 28, 137, 101, 57, 58, 154, 147]),
+    ([149], [21, 105, 134, 52, 86, 120, 4, 121]),
+    ([147], [72, 146, 126, 99, 108, 68, 24]),
+    ([106], [85, 1, 104, 67, 140, 10, 143])
+]
 
-# Route 2
-spawn_point_2 = spawn_points[149]
-# Create route 2 from the chosen spawn points
-route_2_indices = [21, 105, 134, 52, 86, 120, 4, 121]
-route_2 = []
-for ind in route_2_indices:
-    route_2.append(spawn_points[ind].location)
+# Prepare route locations
+route_locations = []
+for spawn_point, indices in routes:
+    route = [spawn_points[spawn_point[0]].location]
+    for ind in indices:
+        route.append(spawn_points[ind].location)
+    route_locations.append(route)
 
-# Route 3
-spawn_point_3 = spawn_points[147]
-# Create route 3 from the chosen spawn points
-route_3_indices = [72, 146, 126, 99, 108, 68, 24]
-route_3 = []
-for ind in route_3_indices:
-    route_3.append(spawn_points[ind].location)
+# Assign vehicles to routes
+assigned_vehicles = {
+    0: [],  # Vehicles for route 1
+    1: [],  # Vehicles for route 2
+    2: [],  # Vehicles for route 3
+    3: []  # Vehicles for route 4
+}
 
-# Route 4
-spawn_point_4 = spawn_points[106]
-# Create route 4 from the chosen spawn points
-route_4_indices = [85, 1, 104, 67, 140, 10, 143]
-route_4 = []
-for ind in route_4_indices:
-    route_4.append(spawn_points[ind].location)
+vehicle_idx = 0
+for route_idx, count in enumerate(route_vehicle_counts):
+    for _ in range(count):
+        if vehicle_idx < len(vehicles):
+            assigned_vehicles[route_idx].append(vehicles[vehicle_idx])
+            vehicle_idx += 1
 
-# Set autopilot mode for vehicles
-for vehicle in vehicles:
-    vehicle.set_autopilot(True)
+# Assign routes to vehicles
+for route_idx, vehicle_list in assigned_vehicles.items():
+    for vehicle in vehicle_list:
+        traffic_manager.set_path(vehicle, route_locations[route_idx])
+        vehicle.set_autopilot(True)
+        # Randomly set the probability that a vehicle will ignore traffic lights
+        traffic_manager.ignore_lights_percentage(vehicle, random.randint(0, 50))
 
-# Finding Traffic lights
-actors = world.get_actors()
+# Set delay to create gap between spawn times
+spawn_delay = 20
+counter = spawn_delay
 
-traffic_lights = actors.filter('traffic_light')
+try:
+    control_traffic_lights(traffic_lights, check_interval=10, density_threshold=5, green_duration=20)
+except KeyboardInterrupt:
+    print("Traffic control interrupted")
 
-# Iterate over each traffic light and set the state
-for traffic_light in traffic_lights:
-    traffic_light.set_state(carla.TrafficLightState.Red)
-    if traffic_light.get_state() == carla.TrafficLightState.Red:
-        traffic_light.set_state(carla.TrafficLightState.Green)
-        traffic_light.set_green_time(10.0)
-
-tm = client.get_trafficmanager(8000)
-tm_port = tm.get_port()
-for v in my_vehicles:
-  v.set_autopilot(True,tm_port)
-danger_car = my_vehicles[0]
-tm.global_distance_to_leading_vehicle(5)
-tm.global_percentage_speed_difference(80)
-for v in my_vehicles:
-  tm.auto_lane_change(v,False)
-
-while True:
-    world.tick()
